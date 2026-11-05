@@ -1,0 +1,100 @@
+"""Small terminal controller for capture and PPS-04 traffic summaries."""
+
+from collections.abc import Callable
+
+from core.types import Status
+from services.capture_service import CaptureService
+from services.summary_service import SummaryService, render_summary
+
+
+class Dashboard:
+    def __init__(
+        self,
+        capture_service: CaptureService | None = None,
+        summary_service: SummaryService | None = None,
+        input_fn: Callable[[str], str] = input,
+        output_fn: Callable[[str], None] = print,
+    ) -> None:
+        self.capture_service = capture_service or CaptureService()
+        self.summary_service = summary_service or SummaryService()
+        self.input = input_fn
+        self.output = output_fn
+        self.session = None
+        self.capture_active = False
+
+    def run(self) -> None:
+        self.output("Pocket Packet Sniffer - traffic dashboard")
+        self.output("Choose an interface, start capture, view the summary, then stop safely.")
+        while True:
+            self.output("\n1) List interfaces  2) Start capture  3) View summary  4) Stop capture  5) Exit")
+            choice = self.input("Select an option: ").strip()
+            if choice == "1":
+                self._list_interfaces()
+            elif choice == "2":
+                self._start_capture()
+            elif choice == "3":
+                self._view_summary()
+            elif choice == "4":
+                self._stop_capture()
+            elif choice == "5":
+                if self.capture_active:
+                    self.output("Stopping the active capture before exit...")
+                    self._stop_capture()
+                break
+            else:
+                self.output("ERROR: input: choose an option from 1 to 5.")
+
+    def _list_interfaces(self) -> None:
+        result = self.capture_service.list_interfaces()
+        if result.status is not Status.OK:
+            self.output(f"ERROR: interface: {result.detail}")
+            return
+        if not result.value:
+            self.output("No network interfaces were found.")
+            return
+        self.output("Available interfaces: " + ", ".join(result.value))
+
+    def _start_capture(self) -> None:
+        if self.capture_active:
+            self.output("ERROR: a capture is already running. View or stop it first.")
+            return
+        interface = self.input("Interface name (use option 1 to list): ").strip()
+        result = self.capture_service.start_capture(interface)
+        if result.status is not Status.OK:
+            self.output(f"ERROR: capture: {result.detail}")
+            return
+        self.session = result.value
+        self.capture_active = True
+        self.output(f"Capture started on {self.session.interface_name}.")
+        self.output("Choose View summary regularly to see new conn.log records.")
+
+    def _view_summary(self) -> None:
+        if self.session is None:
+            self.output("No session is selected. Start a capture first.")
+            return
+        result = self.summary_service.get_summary(self.session)
+        if result.status is not Status.OK:
+            self.output(f"ERROR: summary: {result.detail}")
+            return
+        self.output(render_summary(result.value))
+
+    def _stop_capture(self) -> None:
+        if self.session is None or not self.capture_active:
+            self.output("No capture is running.")
+            return
+        session = self.session
+        status = self.capture_service.stop_capture(session.session_id)
+        if status is not Status.OK:
+            self.output(f"ERROR: capture: could not stop session ({status.value}).")
+            return
+        self.capture_active = False
+        self.output("Capture stopped safely. The final summary is:")
+        result = self.summary_service.get_summary(session)
+        if result.status is Status.OK:
+            self.output(render_summary(result.value))
+        else:
+            self.output(f"ERROR: summary: {result.detail}")
+
+
+if __name__ == "__main__":
+    Dashboard().run()

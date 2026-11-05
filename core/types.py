@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 from typing import Generic, Optional, TypeVar
 
 
@@ -23,3 +24,13 @@ class Result(Generic[T]):
     status: Status
     value: Optional[T] = None
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class Summary:
+    """A session-scoped traffic summary derived from Zeek conn.log records."""
+
+    protocol_breakdown: dict[str, int]
+    top_talkers: list[tuple[str, int]]
+    connection_count: int
+    updated_at: datetime
