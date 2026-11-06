@@ -6,14 +6,12 @@ capture session: reading records never removes them from the log or advances a
 different consumer's cursor.
 """
 
-from dataclasses import dataclass, field
-import os
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
 
 from core.types import Result, Status
 from services.capture_service import CaptureSession
-
 
 DEFAULT_LOG_NAMES = ("conn", "notice")
 

@@ -1,5 +1,5 @@
-from pathlib import Path
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -31,7 +31,7 @@ def test_list_interfaces_returns_available_interfaces(monkeypatch):
 
 
 def test_list_interfaces_handles_empty_interface_list():
-    result = CaptureService(interface_discoverer=lambda: []).list_interfaces()
+    result = CaptureService(interface_discoverer=list).list_interfaces()
 
     assert result.status is Status.OK
     assert result.value == []

@@ -1,8 +1,8 @@
 import os
-from pathlib import Path
 import signal
 import stat
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -89,7 +89,7 @@ def test_start_capture_launches_live_zeek_and_packet_buffered_pcap(tmp_path):
 
     zeek_args, zeek_options = process_factory.calls[0]
     tcpdump_args, tcpdump_options = process_factory.calls[1]
-    assert zeek_args == ["/usr/bin/zeek", "-i", "eth0", "-C"]
+    assert zeek_args == ["/usr/bin/zeek", "-i", "eth0", "-C", str(service._zeek_policy_path),]
     assert Path(zeek_options["cwd"]) == session.zeek_directory
     assert tcpdump_args == [
         "/usr/bin/tcpdump",
@@ -129,7 +129,7 @@ def test_start_capture_rejects_duplicate_interface_capture(tmp_path):
 def test_start_capture_rejects_invalid_interface_before_launching(tmp_path):
     process_factory = FakeProcessFactory()
     service = CaptureService(
-        interface_discoverer=lambda: [],
+        interface_discoverer=list,
         interface_up_checker=lambda _: True,
         session_root=tmp_path / "sessions",
         executable_locator=lambda name: f"/usr/bin/{name}",

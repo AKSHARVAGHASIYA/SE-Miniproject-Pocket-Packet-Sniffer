@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from enum import Enum
 from datetime import datetime
-from typing import Generic, Optional, TypeVar
+from enum import Enum
+from typing import Generic, TypeVar
 
 
 class Status(Enum):
@@ -22,7 +22,7 @@ T = TypeVar("T")
 @dataclass
 class Result(Generic[T]):
     status: Status
-    value: Optional[T] = None
+    value: T | None = None
     detail: str = ""
 
 

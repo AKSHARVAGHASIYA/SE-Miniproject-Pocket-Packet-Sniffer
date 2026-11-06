@@ -1,14 +1,13 @@
 """Session-scoped aggregation of Zeek connection records."""
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Callable
+from datetime import UTC, datetime
 
 from core.types import Result, Status, Summary
 from services.capture_service import CaptureSession
 from services.log_reader import LogReader, ZeekLogRecord
-
 
 UNKNOWN = "unknown"
 
@@ -53,7 +52,7 @@ class SummaryService:
             protocol_breakdown=dict(sorted(totals.protocol_breakdown.items())),
             top_talkers=sorted(totals.talkers.items(), key=lambda item: (-item[1], item[0])),
             connection_count=totals.connection_count,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(UTC),
         )
         return Result(status=Status.OK, value=summary, detail=result.detail)
 
