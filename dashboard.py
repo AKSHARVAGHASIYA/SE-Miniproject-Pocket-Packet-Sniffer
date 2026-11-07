@@ -110,12 +110,12 @@ class Dashboard:
         for alert in alerts:
             self.output(
                 f"[{alert.timestamp or 'Unknown time'}] "
-                f"{alert.note} | "
+                f"[{alert.priority}] {alert.note} | "
                 f"Source: {alert.source or 'Unknown'} | "
                 f"Destination: {alert.destination or 'Unknown'} | "
                 f"Port: {alert.port or 'Unknown'}"
             )
-            self.output(f"  Message: {alert.message}")
+            self.output(f"  Reason: {alert.reason}")
 
     def _start_capture(self) -> None:
         if self.capture_active:

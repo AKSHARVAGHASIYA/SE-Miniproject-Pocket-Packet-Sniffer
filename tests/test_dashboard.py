@@ -108,6 +108,8 @@ def test_dashboard_displays_supported_alerts():
                 "destination": "10.0.0.1",
                 "port": "445",
                 "message": "TCP port scan detected",
+                "priority": "HIGH",
+                "reason": "TCP port scan detected",
             },
         )()
     ]
@@ -128,6 +130,8 @@ def test_dashboard_displays_supported_alerts():
     assert "10.0.0.1" in text
     assert "445" in text
     assert "TCP port scan detected" in text
+    assert any("[HIGH] Scan::Port_Scan" in line for line in output)
+    assert any("Reason: TCP port scan detected" in line for line in output)
 
 def test_dashboard_displays_message_when_no_alerts_exist():
     answers = iter(["2", "eth0", "5", "6", "7"])

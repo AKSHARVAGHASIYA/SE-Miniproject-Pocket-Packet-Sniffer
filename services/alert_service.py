@@ -1,4 +1,4 @@
-"""Session-scoped alerts derived from supported Zeek notice records."""
+"""Session-scoped prioritized alerts derived from supported Zeek notices."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -7,11 +7,11 @@ from core.types import Result, Status
 from services.capture_service import CaptureSession
 from services.log_reader import LogReader
 
-SUPPORTED_NOTICES = frozenset({
-    "Scan::Address_Scan",
-    "Scan::Port_Scan",
-    "Scan::Random_Scan",
-})
+SUPPORTED_NOTICES = {
+    "Scan::Address_Scan": ("MEDIUM", 2),
+    "Scan::Port_Scan": ("HIGH", 3),
+    "Scan::Random_Scan": ("LOW", 1),
+}
 
 
 @dataclass(frozen=True)
@@ -21,14 +21,20 @@ class Alert:
     session_id: str
     timestamp: str | None
     note: str
-    message: str
+    reason: str
     source: str | None
     destination: str | None
     port: str | None
+    priority: str
+
+    @property
+    def message(self) -> str:
+        """Backward-compatible alias for the alert reason."""
+        return self.reason
 
 
 class AlertService:
-    """Collect supported Zeek notices independently for each capture session."""
+    """Collect and prioritize supported Zeek notices per session."""
 
     def __init__(
         self,
@@ -42,7 +48,6 @@ class AlertService:
     def set_enabled(
         self, session: CaptureSession, enabled: bool
     ) -> Result[bool]:
-        """Enable or disable alert collection for one session."""
         if not isinstance(session, CaptureSession):
             return Result(
                 status=Status.INVALID_INPUT,
@@ -57,17 +62,25 @@ class AlertService:
 
         self._enabled[session.session_id] = enabled
         self._alerts.setdefault(session.session_id, [])
-
         return Result(status=Status.OK, value=enabled)
 
     def is_enabled(self, session: CaptureSession) -> bool:
-        """Return whether alerting is enabled for this session."""
         if not isinstance(session, CaptureSession):
             return False
         return self._enabled.get(session.session_id, False)
 
+    @staticmethod
+    def _sort_key(alert: Alert) -> tuple[int, float]:
+        priority_rank = SUPPORTED_NOTICES[alert.note][1]
+
+        try:
+            timestamp = float(alert.timestamp or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+
+        return priority_rank, timestamp
+
     def get_alerts(self, session: CaptureSession) -> Result[list[Alert]]:
-        """Read new notices and return this session's supported alerts."""
         if not isinstance(session, CaptureSession):
             return Result(
                 status=Status.INVALID_INPUT,
@@ -80,8 +93,6 @@ class AlertService:
 
         session_alerts = self._alerts.setdefault(session.session_id, [])
 
-        # Always advance the notice reader, even while disabled. This prevents
-        # old notices from appearing later when alerting is re-enabled.
         if self.is_enabled(session):
             for record in result.value or []:
                 fields = record.fields
@@ -90,20 +101,28 @@ class AlertService:
                 if note not in SUPPORTED_NOTICES:
                     continue
 
+                priority, _ = SUPPORTED_NOTICES[note]
                 session_alerts.append(
                     Alert(
                         session_id=session.session_id,
                         timestamp=fields.get("ts"),
                         note=note,
-                        message=fields.get("msg") or "",
+                        reason=fields.get("msg") or note,
                         source=fields.get("src"),
                         destination=fields.get("dst"),
                         port=fields.get("p"),
+                        priority=priority,
                     )
                 )
 
+        ordered = sorted(
+            session_alerts,
+            key=self._sort_key,
+            reverse=True,
+        )
+
         return Result(
             status=Status.OK,
-            value=list(session_alerts),
+            value=ordered,
             detail=result.detail,
         )
