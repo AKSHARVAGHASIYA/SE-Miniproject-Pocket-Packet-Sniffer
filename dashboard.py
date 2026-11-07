@@ -3,6 +3,7 @@
 from collections.abc import Callable
 
 from core.types import Status
+from services.alert_service import AlertService
 from services.capture_service import CaptureService
 from services.summary_service import SummaryService, render_summary
 
@@ -14,9 +15,11 @@ class Dashboard:
         summary_service: SummaryService | None = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
+        alert_service: AlertService | None = None,
     ) -> None:
         self.capture_service = capture_service or CaptureService()
         self.summary_service = summary_service or SummaryService()
+        self.alert_service = alert_service or AlertService()
         self.input = input_fn
         self.output = output_fn
         self.session = None
@@ -26,7 +29,15 @@ class Dashboard:
         self.output("Pocket Packet Sniffer - traffic dashboard")
         self.output("Choose an interface, start capture, view the summary, then stop safely.")
         while True:
-            self.output("\n1) List interfaces  2) Start capture  3) View summary  4) Stop capture  5) Exit")
+            self.output(
+                "\n1) List interfaces  "
+                "2) Start capture  "
+                "3) View summary  "
+                "4) Stop capture  "
+                "5) Toggle alerting  "
+                "6) View alerts  "
+                "7) Exit"
+            )
             choice = self.input("Select an option: ").strip()
             if choice == "1":
                 self._list_interfaces()
@@ -37,12 +48,16 @@ class Dashboard:
             elif choice == "4":
                 self._stop_capture()
             elif choice == "5":
+                self._toggle_alerting()
+            elif choice == "6":
+                self._view_alerts()
+            elif choice == "7":
                 if self.capture_active:
                     self.output("Stopping the active capture before exit...")
                     self._stop_capture()
                 break
             else:
-                self.output("ERROR: input: choose an option from 1 to 5.")
+                self.output("ERROR: input: choose an option from 1 to 7.")
 
     def _list_interfaces(self) -> None:
         result = self.capture_service.list_interfaces()
@@ -53,6 +68,54 @@ class Dashboard:
             self.output("No network interfaces were found.")
             return
         self.output("Available interfaces: " + ", ".join(result.value))
+
+    def _toggle_alerting(self) -> None:
+        """Enable or disable alerting for the selected capture session."""
+        if self.session is None:
+            self.output("ERROR: Start a capture first.")
+            return
+
+        enabled = not self.alert_service.is_enabled(self.session)
+        result = self.alert_service.set_enabled(self.session, enabled)
+
+        if result.status is not Status.OK:
+            self.output(f"ERROR: {result.detail}")
+            return
+
+        if enabled:
+            self.output("Alerting enabled for this session.")
+        else:
+            self.output("Alerting disabled for this session.")
+
+    def _view_alerts(self) -> None:
+        """Display supported alerts for the selected capture session."""
+        if self.session is None:
+            self.output("ERROR: Start a capture first.")
+            return
+
+        result = self.alert_service.get_alerts(self.session)
+
+        if result.status is not Status.OK:
+            self.output(f"ERROR: {result.detail}")
+            return
+
+        alerts = result.value or []
+
+        if not alerts:
+            self.output("No supported scan alerts detected for this session.")
+            return
+
+        self.output(f"\nSupported alerts ({len(alerts)}):")
+
+        for alert in alerts:
+            self.output(
+                f"[{alert.timestamp or 'Unknown time'}] "
+                f"{alert.note} | "
+                f"Source: {alert.source or 'Unknown'} | "
+                f"Destination: {alert.destination or 'Unknown'} | "
+                f"Port: {alert.port or 'Unknown'}"
+            )
+            self.output(f"  Message: {alert.message}")
 
     def _start_capture(self) -> None:
         if self.capture_active:

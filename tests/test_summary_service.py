@@ -2,9 +2,7 @@ from pathlib import Path
 
 from core.types import Status
 from services.capture_service import CaptureSession
-from services.log_reader import LogReader
 from services.summary_service import SummaryService, render_summary
-
 
 CONN_HEADER = """#separator \\x09
 #set_separator\t,

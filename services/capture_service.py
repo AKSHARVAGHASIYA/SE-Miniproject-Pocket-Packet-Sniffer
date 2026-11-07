@@ -1,13 +1,13 @@
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import shutil
 import signal
 import socket
 import subprocess
 import threading
-from typing import Callable
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 
 from core.types import Result, Status
 
@@ -17,6 +17,9 @@ DEFAULT_SESSION_ROOT = (
 )
 PROCESS_STOP_TIMEOUT = 5
 
+DEFAULT_ZEEK_POLICY = (
+    Path(__file__).resolve().parents[1] / "zeek" / "pps05.zeek"
+)
 
 @dataclass(frozen=True)
 class CaptureSession:
@@ -52,12 +55,14 @@ class CaptureService:
         session_root: Path = DEFAULT_SESSION_ROOT,
         executable_locator: Callable[[str], str | None] = shutil.which,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+        zeek_policy_path: Path = DEFAULT_ZEEK_POLICY,
     ) -> None:
         self._interface_discoverer = interface_discoverer
         self._interface_up_checker = interface_up_checker
         self._session_root = Path(session_root)
         self._executable_locator = executable_locator
         self._process_factory = process_factory
+        self._zeek_policy_path = Path(zeek_policy_path)
         self._running_captures: dict[str, _RunningCapture] = {}
         self._interface_sessions: dict[str, str] = {}
         self._lock = threading.RLock()
@@ -263,16 +268,24 @@ class CaptureService:
     ) -> subprocess.Popen:
         stdout_path = session.session_directory / "zeek.stdout.log"
         stderr_path = session.session_directory / "zeek.stderr.log"
-        with self._create_private_file(stdout_path) as stdout_file:
-            with self._create_private_file(stderr_path) as stderr_file:
-                return self._process_factory(
-                    [executable, "-i", session.interface_name, "-C"],
-                    cwd=session.zeek_directory,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    shell=False,
-                )
+        with (
+            self._create_private_file(stdout_path) as stdout_file,
+            self._create_private_file(stderr_path) as stderr_file,
+        ):
+            return self._process_factory(
+                [
+                    executable,
+                    "-i",
+                    session.interface_name,
+                    "-C",
+                    str(self._zeek_policy_path),
+                ],
+                cwd=session.zeek_directory,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                shell=False,
+            )
 
     def _launch_tcpdump(
         self, executable: str, session: CaptureSession

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from pathlib import Path
 
 from core.types import Result, Status, Summary
 from dashboard import Dashboard
@@ -31,9 +30,24 @@ class FakeSummary:
     def get_summary(self, session):
         return Result(Status.OK, Summary({"tcp": 1}, [("10.0.0.1", 1)], 1, None))
 
+class FakeAlert:
+    def __init__(self):
+        self.enabled = {}
+        self.alerts = []
+
+    def is_enabled(self, session):
+        return self.enabled.get(session.session_id, False)
+
+    def set_enabled(self, session, enabled):
+        self.enabled[session.session_id] = enabled
+        return Result(Status.OK, enabled)
+
+    def get_alerts(self, session):
+        return Result(Status.OK, list(self.alerts))
+
 
 def test_dashboard_guides_user_through_capture_summary_and_safe_stop():
-    answers = iter(["1", "2", "eth0", "3", "4", "3", "5"])
+    answers = iter(["1", "2", "eth0", "3", "4", "3", "7"])
     output = []
     capture = FakeCapture()
     Dashboard(capture, FakeSummary(), lambda _: next(answers), output.append).run()
@@ -48,10 +62,88 @@ def test_dashboard_guides_user_through_capture_summary_and_safe_stop():
 
 
 def test_dashboard_empty_and_invalid_choices_do_not_require_hardware():
-    answers = iter(["9", "3", "5"])
+    answers = iter(["9", "3", "7"])
     output = []
     Dashboard(FakeCapture(), FakeSummary(), lambda _: next(answers), output.append).run()
 
     text = "\n".join(output)
     assert "choose an option" in text
     assert "No session is selected" in text
+
+def test_dashboard_can_enable_and_disable_alerting():
+    answers = iter(["2", "eth0", "5", "5", "7"])
+    output = []
+    capture = FakeCapture()
+    alerts = FakeAlert()
+
+    Dashboard(
+        capture,
+        FakeSummary(),
+        lambda _: next(answers),
+        output.append,
+        alerts,
+    ).run()
+
+    text = "\n".join(output)
+
+    assert "Alerting enabled for this session." in text
+    assert "Alerting disabled for this session." in text
+    assert alerts.enabled["s1"] is False
+    assert capture.stopped == ["s1"]
+
+def test_dashboard_displays_supported_alerts():
+    answers = iter(["2", "eth0", "5", "6", "7"])
+    output = []
+    capture = FakeCapture()
+    alerts = FakeAlert()
+
+    alerts.alerts = [
+        type(
+            "FakeNotice",
+            (),
+            {
+                "timestamp": "1234567890",
+                "note": "Scan::Port_Scan",
+                "source": "10.0.0.5",
+                "destination": "10.0.0.1",
+                "port": "445",
+                "message": "TCP port scan detected",
+            },
+        )()
+    ]
+
+    Dashboard(
+        capture,
+        FakeSummary(),
+        lambda _: next(answers),
+        output.append,
+        alerts,
+    ).run()
+
+    text = "\n".join(output)
+
+    assert "Supported alerts (1)" in text
+    assert "Scan::Port_Scan" in text
+    assert "10.0.0.5" in text
+    assert "10.0.0.1" in text
+    assert "445" in text
+    assert "TCP port scan detected" in text
+
+def test_dashboard_displays_message_when_no_alerts_exist():
+    answers = iter(["2", "eth0", "5", "6", "7"])
+    output = []
+    capture = FakeCapture()
+    alerts = FakeAlert()
+
+    Dashboard(
+        capture,
+        FakeSummary(),
+        lambda _: next(answers),
+        output.append,
+        alerts,
+    ).run()
+
+    text = "\n".join(output)
+
+    assert "No supported scan alerts detected for this session." in text
+    assert capture.stopped == ["s1"]
