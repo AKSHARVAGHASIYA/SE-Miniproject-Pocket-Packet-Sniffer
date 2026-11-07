@@ -74,13 +74,21 @@ def test_collects_supported_scan_notices(tmp_path):
     assert result.status is Status.OK
     assert len(result.value) == 3
     assert [alert.note for alert in result.value] == [
-        "Scan::Address_Scan",
         "Scan::Port_Scan",
+        "Scan::Address_Scan",
         "Scan::Random_Scan",
     ]
-    assert result.value[0].source == "10.0.0.1"
-    assert result.value[0].port == "445"
-    assert result.value[1].destination == "10.0.0.3"
+
+    assert [alert.priority for alert in result.value] == [
+        "HIGH",
+        "MEDIUM",
+        "LOW",
+    ]
+    assert result.value[0].source == "10.0.0.2"
+    assert result.value[0].port == "22"
+    assert result.value[1].source == "10.0.0.1"
+    assert result.value[1].port == "445"
+    assert result.value[0].destination == "10.0.0.3"
 
 
 def test_ignores_unsupported_notice_types(tmp_path):
@@ -206,3 +214,32 @@ def test_rejects_invalid_session_and_enabled_value(tmp_path):
     assert invalid_session.status is Status.INVALID_INPUT
     assert invalid_value.status is Status.INVALID_INPUT
     assert invalid_alert_query.status is Status.INVALID_INPUT
+
+def test_alerts_are_sorted_by_priority_then_timestamp(tmp_path):
+    session = make_session(tmp_path, "priority")
+    log = session.zeek_directory / "notice.log"
+    log.write_text(NOTICE_HEADER, encoding="utf-8")
+
+    append_notices(
+        log,
+        "100.0\tA\tScan::Random_Scan\tRandom scan\t10.0.0.1\t-\t-",
+        "200.0\tB\tScan::Address_Scan\tAddress scan\t10.0.0.2\t-\t-",
+        "50.0\tC\tScan::Port_Scan\tPort scan\t10.0.0.3\t-\t22",
+    )
+
+    service = AlertService()
+    service.set_enabled(session, True)
+
+    result = service.get_alerts(session)
+
+    assert result.status is Status.OK
+    assert [alert.priority for alert in result.value] == [
+        "HIGH",
+        "MEDIUM",
+        "LOW",
+    ]
+    assert [alert.timestamp for alert in result.value] == [
+        "50.0",
+        "200.0",
+        "100.0",
+    ]
