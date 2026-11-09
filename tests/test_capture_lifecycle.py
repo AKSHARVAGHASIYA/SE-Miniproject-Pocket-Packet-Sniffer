@@ -1,4 +1,5 @@
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -6,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from core.types import Status
+from core.types import Result, Status
 from services.capture_service import CaptureService
 
 
@@ -246,3 +247,55 @@ def test_stop_capture_returns_not_found_for_unknown_session(tmp_path):
     service = make_service(tmp_path)
 
     assert service.stop_capture("unknown") is Status.NOT_FOUND
+
+
+def test_stopped_session_is_indexed_and_available_from_a_fresh_service(
+    tmp_path, sample_zeek_logs
+):
+    service = make_service(tmp_path)
+    started = service.start_capture("eth0")
+    session = started.value
+    log_path = session.zeek_directory / "conn.log"
+    shutil.copyfile(sample_zeek_logs / "conn.log", log_path)
+
+    assert service.stop_capture(session.session_id) is Status.OK
+
+    restored_service = make_service(tmp_path)
+    indexed = restored_service.list_completed_sessions()
+
+    assert indexed.status is Status.OK
+    assert len(indexed.value) == 1
+    record = indexed.value[0]
+    assert record.session_id == session.session_id
+    assert record.interface_name == "eth0"
+    assert record.started_at.tzinfo is not None
+    assert record.ended_at >= record.started_at
+    assert record.pcap_path == session.pcap_path.resolve()
+    assert record.zeek_directory == session.zeek_directory.resolve()
+    assert record.zeek_log_paths == (log_path.resolve(),)
+    assert restored_service.stop_capture(session.session_id) is Status.NOT_FOUND
+
+
+def test_index_failure_is_reported_and_can_be_retried_without_duplication(
+    tmp_path, monkeypatch
+):
+    service = make_service(tmp_path)
+    started = service.start_capture("eth0")
+    session = started.value
+    index = service._session_index
+    original_add = index.add_completed_session
+
+    def fail_index(_):
+        return Result(Status.IO_ERROR, detail="simulated index write failure")
+
+    monkeypatch.setattr(index, "add_completed_session", fail_index)
+
+    assert service.stop_capture(session.session_id) is Status.IO_ERROR
+    assert "simulated index write failure" in service.last_error
+
+    monkeypatch.setattr(index, "add_completed_session", original_add)
+    assert service.stop_capture(session.session_id) is Status.OK
+    indexed = service.list_completed_sessions()
+    assert indexed.status is Status.OK
+    assert len(indexed.value) == 1
+    assert service.stop_capture(session.session_id) is Status.NOT_FOUND

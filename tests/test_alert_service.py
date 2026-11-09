@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from core.types import Status
 from services.alert_service import AlertService
@@ -243,3 +244,24 @@ def test_alerts_are_sorted_by_priority_then_timestamp(tmp_path):
         "200.0",
         "100.0",
     ]
+
+
+def test_alert_service_uses_synthetic_notice_fixture(tmp_path, sample_zeek_logs):
+    session = make_session(tmp_path, "fixture")
+    shutil.copyfile(
+        sample_zeek_logs / "notice.log", session.zeek_directory / "notice.log"
+    )
+    service = AlertService()
+    assert service.set_enabled(session, True).status is Status.OK
+
+    result = service.get_alerts(session)
+
+    assert result.status is Status.OK
+    assert [(alert.note, alert.priority) for alert in result.value] == [
+        ("Scan::Port_Scan", "HIGH"),
+        ("Scan::Address_Scan", "MEDIUM"),
+        ("Scan::Random_Scan", "LOW"),
+    ]
+    assert result.value[0].message == "Synthetic port scan notice"
+    assert result.value[0].source == "198.51.100.20"
+    assert result.value[0].destination == "203.0.113.8"

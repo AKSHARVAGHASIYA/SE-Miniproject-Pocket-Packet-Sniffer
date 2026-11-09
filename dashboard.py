@@ -148,7 +148,11 @@ class Dashboard:
         session = self.session
         status = self.capture_service.stop_capture(session.session_id)
         if status is not Status.OK:
-            self.output(f"ERROR: capture: could not stop session ({status.value}).")
+            detail = getattr(self.capture_service, "last_error", "")
+            message = f"ERROR: capture: could not stop session ({status.value})"
+            if detail:
+                message += f": {detail}"
+            self.output(message + ".")
             return
         self.capture_active = False
         self.output("Capture stopped safely. The final summary is:")

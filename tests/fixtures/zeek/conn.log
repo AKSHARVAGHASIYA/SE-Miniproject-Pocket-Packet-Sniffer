@@ -1,0 +1,12 @@
+#separator \x09
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#path	conn
+#open	2026-01-01-00-00-00
+#fields	ts	uid	id.orig_h	id.resp_h	proto	service
+#types	time	string	addr	addr	enum	set[string]
+1.000000	C_SYNTH_001	192.0.2.10	198.51.100.20	tcp	(empty)
+2.000000	C_SYNTH_002	192.0.2.10	203.0.113.8	udp	dns
+3.000000	C_SYNTH_003	203.0.113.8	192.0.2.10	tcp	http
+#close	2026-01-01-00-00-03
