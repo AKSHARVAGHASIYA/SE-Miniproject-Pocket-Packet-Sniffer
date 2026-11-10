@@ -366,6 +366,8 @@ class CaptureService:
                     "-n",
                     "-i",
                     session.interface_name,
+                    "-Z",
+                    "root",
                     "-w",
                     str(session.pcap_path),
                 ],

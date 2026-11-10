@@ -44,6 +44,22 @@ also continue to cover malformed and partial lines, truncation, session
 isolation, incremental reads, disabled alerts, storage errors, and dashboard
 rendering.
 
+## Interactive offline dashboard demo
+
+The dashboard can be shown without network access, Zeek, tcpdump, or elevated
+permissions using the synthetic fixtures:
+
+```powershell
+python demo.py
+```
+
+Choose option 1 to list the synthetic interface, option 2 to start a session
+using `demo0`, option 3 to show the traffic summary, option 5 to enable alerting,
+and option 6 to show the supported scan alerts. Choose option 4 to stop the
+simulated session and option 7 to exit. The demo displays an offline-only
+warning and does not capture packets. Its temporary session files are removed
+when the program exits.
+
 ## Optional PCAP replay
 
 No PCAP fixture is included, and the automated tests do not invoke Zeek replay.

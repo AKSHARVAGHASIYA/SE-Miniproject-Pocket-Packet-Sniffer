@@ -98,6 +98,8 @@ def test_start_capture_launches_live_zeek_and_packet_buffered_pcap(tmp_path):
         "-n",
         "-i",
         "eth0",
+        "-Z",
+        "root",
         "-w",
         str(session.pcap_path),
     ]
