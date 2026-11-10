@@ -4,9 +4,10 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,9 @@ DEFAULT_SESSION_ROOT = (
     Path.home() / ".local" / "share" / "pocket-packet-sniffer" / "sessions"
 )
 PROCESS_STOP_TIMEOUT = 5
+MONITOR_INTERVAL_SECONDS = 1.0
+MAX_CAPTURE_DURATION_SECONDS = 24 * 60 * 60
+ALLOWED_PROTOCOL_FILTERS = frozenset({"tcp", "udp", "icmp"})
 
 DEFAULT_ZEEK_POLICY = (
     Path(__file__).resolve().parents[1] / "zeek" / "pps05.zeek"
@@ -30,6 +34,8 @@ class CaptureSession:
     session_directory: Path
     pcap_path: Path
     zeek_directory: Path
+    duration_seconds: int | None = None
+    protocol_filter: str | None = None
 
 
 @dataclass
@@ -38,13 +44,74 @@ class _RunningCapture:
     zeek_process: subprocess.Popen
     tcpdump_process: subprocess.Popen
     started_at: datetime
+    started_monotonic: float
+    duration_seconds: int | None
+    protocol_filter: str | None
     ended_at: datetime | None = None
+    monitor_stop: threading.Event = field(default_factory=threading.Event)
+    monitor_thread: threading.Thread | None = None
 
 
 def interface_is_up(interface_name: str) -> bool:
     flags_path = Path("/sys/class/net") / interface_name / "flags"
     flags = int(flags_path.read_text(encoding="ascii").strip(), 16)
     return bool(flags & IFF_UP)
+
+
+def interface_has_carrier(interface_name: str) -> bool | None:
+    """Return Linux link state when sysfs exposes it, otherwise ``None``.
+
+    A missing or unsupported carrier attribute is deliberately *unknown*, not a
+    disconnect.  On Linux, ``carrier == 0`` detects a cable/link loss that can
+    leave the administrative IFF_UP flag set.  Other platforms retain the
+    existing interface-removal and process-health monitoring.
+    """
+    carrier_path = Path("/sys/class/net") / interface_name / "carrier"
+    try:
+        value = carrier_path.read_text(encoding="ascii").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
+def validate_duration(duration: int | str | None) -> Result[int | None]:
+    """Validate a bounded duration before any capture command is launched."""
+    if duration is None or duration == "":
+        return Result(Status.OK, None)
+    if isinstance(duration, bool):
+        return Result(Status.INVALID_INPUT, detail="Duration must be a whole number of seconds.")
+    if isinstance(duration, str):
+        if not duration.isdecimal():
+            return Result(Status.INVALID_INPUT, detail="Duration must be a whole number of seconds.")
+        duration = int(duration)
+    if not isinstance(duration, int) or not 0 < duration <= MAX_CAPTURE_DURATION_SECONDS:
+        return Result(
+            Status.INVALID_INPUT,
+            detail=(
+                "Duration must be between 1 and "
+                f"{MAX_CAPTURE_DURATION_SECONDS} seconds."
+            ),
+        )
+    return Result(Status.OK, duration)
+
+
+def validate_protocol_filter(protocol_filter: str | None) -> Result[str | None]:
+    """Only permit a small BPF allowlist; never accept arbitrary expressions."""
+    if protocol_filter is None or protocol_filter == "":
+        return Result(Status.OK, None)
+    if not isinstance(protocol_filter, str):
+        return Result(Status.INVALID_INPUT, detail="Protocol filter must be TCP, UDP, or ICMP.")
+    normalized = protocol_filter.lower()
+    if normalized not in ALLOWED_PROTOCOL_FILTERS:
+        return Result(
+            Status.INVALID_INPUT,
+            detail="Protocol filter must be one of: tcp, udp, icmp.",
+        )
+    return Result(Status.OK, normalized)
 
 
 def discover_interfaces() -> list[str]:
@@ -56,14 +123,19 @@ class CaptureService:
         self,
         interface_discoverer: Callable[[], list[str]] = discover_interfaces,
         interface_up_checker: Callable[[str], bool] = interface_is_up,
+        interface_carrier_checker: Callable[[str], bool | None] = interface_has_carrier,
         session_root: Path = DEFAULT_SESSION_ROOT,
         executable_locator: Callable[[str], str | None] = shutil.which,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
         zeek_policy_path: Path = DEFAULT_ZEEK_POLICY,
         session_index: SessionIndex | None = None,
+        event_notifier: Callable[[str], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        monitor_interval_seconds: float = MONITOR_INTERVAL_SECONDS,
     ) -> None:
         self._interface_discoverer = interface_discoverer
         self._interface_up_checker = interface_up_checker
+        self._interface_carrier_checker = interface_carrier_checker
         self._session_root = Path(session_root)
         self._executable_locator = executable_locator
         self._process_factory = process_factory
@@ -73,11 +145,18 @@ class CaptureService:
         self._interface_sessions: dict[str, str] = {}
         self._lock = threading.RLock()
         self._last_error = ""
+        self._event_notifier = event_notifier
+        self._clock = clock
+        self._monitor_interval_seconds = monitor_interval_seconds
 
     @property
     def last_error(self) -> str:
         """Detail for the most recent stop failure, if any."""
         return self._last_error
+
+    def set_event_notifier(self, event_notifier: Callable[[str], None] | None) -> None:
+        """Set the dashboard callback used for asynchronous capture events."""
+        self._event_notifier = event_notifier
 
     def list_completed_sessions(self) -> Result[list[SessionRecord]]:
         return self._session_index.list_sessions()
@@ -138,7 +217,18 @@ class CaptureService:
 
         return Result(status=Status.OK)
 
-    def start_capture(self, interface_name: str) -> Result[CaptureSession]:
+    def start_capture(
+        self,
+        interface_name: str,
+        duration: int | str | None = None,
+        protocol_filter: str | None = None,
+    ) -> Result[CaptureSession]:
+        duration_result = validate_duration(duration)
+        if duration_result.status is not Status.OK:
+            return Result(duration_result.status, detail=duration_result.detail)
+        filter_result = validate_protocol_filter(protocol_filter)
+        if filter_result.status is not Status.OK:
+            return Result(filter_result.status, detail=filter_result.detail)
         validation = self.validate_interface(interface_name)
         if validation.status is not Status.OK:
             return Result(status=validation.status, detail=validation.detail)
@@ -174,6 +264,8 @@ class CaptureService:
                 session_directory=session_directory,
                 pcap_path=pcap_path,
                 zeek_directory=zeek_directory,
+                duration_seconds=duration_result.value,
+                protocol_filter=filter_result.value,
             )
 
             zeek_process = None
@@ -183,8 +275,12 @@ class CaptureService:
                 self._create_private_directory(session_directory)
                 self._create_private_directory(zeek_directory)
                 self._create_private_file(pcap_path).close()
-                zeek_process = self._launch_zeek(zeek_executable, session)
-                tcpdump_process = self._launch_tcpdump(tcpdump_executable, session)
+                zeek_process = self._launch_zeek(
+                    zeek_executable, session, filter_result.value
+                )
+                tcpdump_process = self._launch_tcpdump(
+                    tcpdump_executable, session, filter_result.value
+                )
             except PermissionError as error:
                 failed_processes = [
                     process
@@ -230,8 +326,12 @@ class CaptureService:
                 zeek_process=zeek_process,
                 tcpdump_process=tcpdump_process,
                 started_at=datetime.now(timezone.utc),
+                started_monotonic=self._clock(),
+                duration_seconds=duration_result.value,
+                protocol_filter=filter_result.value,
             )
             self._interface_sessions[interface_name] = session_id
+            self._start_monitor(session_id)
             return Result(status=Status.OK, value=session)
 
     def stop_capture(self, session_id: str) -> Status:
@@ -240,6 +340,7 @@ class CaptureService:
             capture = self._running_captures.get(session_id)
             if capture is None:
                 return Status.NOT_FOUND
+            capture.monitor_stop.set()
 
             errors: list[str] = []
             if capture.ended_at is None:
@@ -294,6 +395,96 @@ class CaptureService:
                 )
             return Status.OK
 
+    def _start_monitor(self, session_id: str) -> None:
+        """Start a daemon health monitor after a session is fully registered."""
+        capture = self._running_captures[session_id]
+        monitor = threading.Thread(
+            target=self._monitor_capture,
+            args=(session_id,),
+            name=f"capture-monitor-{session_id[:8]}",
+            daemon=True,
+        )
+        capture.monitor_thread = monitor
+        monitor.start()
+
+    def _monitor_capture(self, session_id: str) -> None:
+        while True:
+            with self._lock:
+                capture = self._running_captures.get(session_id)
+                if capture is None or capture.monitor_stop.is_set():
+                    return
+                stop_event = capture.monitor_stop
+            if stop_event.wait(self._monitor_interval_seconds):
+                return
+            self._monitor_once(session_id)
+
+    def _monitor_once(self, session_id: str) -> None:
+        """Perform one deterministic, passive health check for a testable monitor."""
+        with self._lock:
+            capture = self._running_captures.get(session_id)
+            if capture is None or capture.monitor_stop.is_set():
+                return
+            if (
+                capture.duration_seconds is not None
+                and self._clock() - capture.started_monotonic
+                >= capture.duration_seconds
+            ):
+                event = "Capture duration expired; stopping capture safely."
+            else:
+                event = self._capture_health_problem(capture)
+        if event is None:
+            return
+        # Notification precedes potentially slow process shutdown so a terminal
+        # blocked in input receives the warning within one monitor interval.
+        self._notify(event)
+        status = self.stop_capture(session_id)
+        if status is not Status.OK:
+            self._notify(
+                f"ERROR: capture finalization failed after automatic stop: {self.last_error}"
+            )
+
+    def _capture_health_problem(self, capture: _RunningCapture) -> str | None:
+        try:
+            interfaces = self._interface_discoverer()
+        except OSError:
+            interfaces = None
+        if interfaces is not None and capture.session.interface_name not in interfaces:
+            return f"Interface {capture.session.interface_name!r} was removed; stopping capture safely."
+
+        try:
+            carrier = self._interface_carrier_checker(capture.session.interface_name)
+        except OSError:
+            carrier = None
+        if carrier is False:
+            return f"Link loss on interface {capture.session.interface_name!r}; stopping capture safely."
+
+        try:
+            is_up = self._interface_up_checker(capture.session.interface_name)
+        except FileNotFoundError:
+            return f"Interface {capture.session.interface_name!r} was removed; stopping capture safely."
+        except (OSError, ValueError):
+            is_up = True  # unknown state must not be treated as a disconnect
+        if not is_up:
+            return f"Interface {capture.session.interface_name!r} is no longer up; stopping capture safely."
+
+        for name, process in (
+            ("tcpdump", capture.tcpdump_process),
+            ("Zeek", capture.zeek_process),
+        ):
+            returncode = process.poll()
+            if returncode is not None:
+                return f"{name} exited unexpectedly (exit code {returncode}); stopping capture safely."
+        return None
+
+    def _notify(self, message: str) -> None:
+        notifier = self._event_notifier
+        if notifier is not None:
+            try:
+                notifier(message)
+            except Exception:
+                # A terminal callback must never crash or prevent capture cleanup.
+                pass
+
     def _completed_session_record(
         self, capture: _RunningCapture
     ) -> SessionRecord:
@@ -331,7 +522,7 @@ class CaptureService:
         return os.fdopen(descriptor, "wb")
 
     def _launch_zeek(
-        self, executable: str, session: CaptureSession
+        self, executable: str, session: CaptureSession, protocol_filter: str | None
     ) -> subprocess.Popen:
         stdout_path = session.session_directory / "zeek.stdout.log"
         stderr_path = session.session_directory / "zeek.stderr.log"
@@ -339,14 +530,12 @@ class CaptureService:
             self._create_private_file(stdout_path) as stdout_file,
             self._create_private_file(stderr_path) as stderr_file,
         ):
+            arguments = [executable, "-i", session.interface_name]
+            if protocol_filter is not None:
+                arguments.extend(["-f", protocol_filter])
+            arguments.extend(["-C", str(self._zeek_policy_path)])
             return self._process_factory(
-                [
-                    executable,
-                    "-i",
-                    session.interface_name,
-                    "-C",
-                    str(self._zeek_policy_path),
-                ],
+                arguments,
                 cwd=session.zeek_directory,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
@@ -355,22 +544,25 @@ class CaptureService:
             )
 
     def _launch_tcpdump(
-        self, executable: str, session: CaptureSession
+        self, executable: str, session: CaptureSession, protocol_filter: str | None
     ) -> subprocess.Popen:
         stderr_path = session.session_directory / "tcpdump.stderr.log"
         with self._create_private_file(stderr_path) as stderr_file:
+            arguments = [
+                executable,
+                "-U",
+                "-n",
+                "-i",
+                session.interface_name,
+                "-Z",
+                "root",
+                "-w",
+                str(session.pcap_path),
+            ]
+            if protocol_filter is not None:
+                arguments.append(protocol_filter)
             return self._process_factory(
-                [
-                    executable,
-                    "-U",
-                    "-n",
-                    "-i",
-                    session.interface_name,
-                    "-Z",
-                    "root",
-                    "-w",
-                    str(session.pcap_path),
-                ],
+                arguments,
                 cwd=session.session_directory,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,

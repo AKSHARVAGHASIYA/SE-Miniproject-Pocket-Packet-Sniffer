@@ -12,7 +12,12 @@ from services.summary_service import SummaryService, render_summary
 class CaptureController(Protocol):
     def list_interfaces(self) -> Result[list[str]]: ...
 
-    def start_capture(self, interface_name: str) -> Result[CaptureSession]: ...
+    def start_capture(
+        self,
+        interface_name: str,
+        duration: int | str | None = None,
+        protocol_filter: str | None = None,
+    ) -> Result[CaptureSession]: ...
 
     def stop_capture(self, session_id: str) -> Status: ...
 
@@ -33,6 +38,9 @@ class Dashboard:
         self.output = output_fn
         self.session = None
         self.capture_active = False
+        set_notifier = getattr(self.capture_service, "set_event_notifier", None)
+        if callable(set_notifier):
+            set_notifier(self._on_capture_event)
 
     def run(self) -> None:
         self.output("Pocket Packet Sniffer - traffic dashboard")
@@ -131,13 +139,31 @@ class Dashboard:
             self.output("ERROR: a capture is already running. View or stop it first.")
             return
         interface = self.input("Interface name (use option 1 to list): ").strip()
-        result = self.capture_service.start_capture(interface)
+        duration = self.input(
+            "Maximum duration in seconds (blank for manual stop): "
+        ).strip()
+        protocol_filter = self.input(
+            "Protocol filter [tcp, udp, icmp] (blank for all traffic): "
+        ).strip()
+        result = self.capture_service.start_capture(
+            interface,
+            duration=duration or None,
+            protocol_filter=protocol_filter or None,
+        )
         if result.status is not Status.OK:
             self.output(f"ERROR: capture: {result.detail}")
             return
         self.session = result.value
         self.capture_active = True
-        self.output(f"Capture started on {self.session.interface_name}.")
+        options = []
+        duration_seconds = getattr(self.session, "duration_seconds", None)
+        protocol_filter = getattr(self.session, "protocol_filter", None)
+        if duration_seconds is not None:
+            options.append(f"maximum {duration_seconds} seconds")
+        if protocol_filter is not None:
+            options.append(f"{protocol_filter.upper()} only")
+        suffix = f" ({', '.join(options)})." if options else "."
+        self.output(f"Capture started on {self.session.interface_name}{suffix}")
         self.output("Choose View summary regularly to see new conn.log records.")
 
     def _view_summary(self) -> None:
@@ -151,7 +177,7 @@ class Dashboard:
         self.output(render_summary(result.value))
 
     def _stop_capture(self) -> None:
-        if self.session is None or not self.capture_active:
+        if self.session is None:
             self.output("No capture is running.")
             return
         session = self.session
@@ -170,6 +196,12 @@ class Dashboard:
             self.output(render_summary(result.value))
         else:
             self.output(f"ERROR: summary: {result.detail}")
+
+    def _on_capture_event(self, message: str) -> None:
+        """Print monitor warnings immediately, even while input() is waiting."""
+        self.output(message)
+        if "stopping capture safely" in message:
+            self.capture_active = False
 
 
 if __name__ == "__main__":

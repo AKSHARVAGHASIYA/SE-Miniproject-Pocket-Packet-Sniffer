@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
+import threading
 
 from core.types import Result, Status, Summary
 from dashboard import Dashboard
@@ -22,12 +23,17 @@ class FakeCapture:
     def list_interfaces(self):
         return Result(Status.OK, ["eth0"])
 
-    def start_capture(self, interface):
+    def start_capture(self, interface, duration=None, protocol_filter=None):
         return Result(Status.OK, self.session) if interface == "eth0" else Result(Status.INTERFACE_UNAVAILABLE, detail="not available")
 
     def stop_capture(self, session_id):
         self.stopped.append(session_id)
         return Status.OK
+
+
+class NotifyingFakeCapture(FakeCapture):
+    def set_event_notifier(self, notifier):
+        self.notifier = notifier
 
 
 class FakeSummary:
@@ -51,7 +57,7 @@ class FakeAlert:
 
 
 def test_dashboard_guides_user_through_capture_summary_and_safe_stop():
-    answers = iter(["1", "2", "eth0", "3", "4", "3", "7"])
+    answers = iter(["1", "2", "eth0", "", "", "3", "4", "3", "7"])
     output = []
     capture = FakeCapture()
     Dashboard(capture, FakeSummary(), lambda _: next(answers), output.append).run()
@@ -75,7 +81,7 @@ def test_dashboard_empty_and_invalid_choices_do_not_require_hardware():
     assert "No session is selected" in text
 
 def test_dashboard_can_enable_and_disable_alerting():
-    answers = iter(["2", "eth0", "5", "5", "7"])
+    answers = iter(["2", "eth0", "", "", "5", "5", "7"])
     output = []
     capture = FakeCapture()
     alerts = FakeAlert()
@@ -96,7 +102,7 @@ def test_dashboard_can_enable_and_disable_alerting():
     assert capture.stopped == ["s1"]
 
 def test_dashboard_displays_supported_alerts():
-    answers = iter(["2", "eth0", "5", "6", "7"])
+    answers = iter(["2", "eth0", "", "", "5", "6", "7"])
     output = []
     capture = FakeCapture()
     alerts = FakeAlert()
@@ -138,7 +144,7 @@ def test_dashboard_displays_supported_alerts():
     assert any("Reason: TCP port scan detected" in line for line in output)
 
 def test_dashboard_displays_message_when_no_alerts_exist():
-    answers = iter(["2", "eth0", "5", "6", "7"])
+    answers = iter(["2", "eth0", "", "", "5", "6", "7"])
     output = []
     capture = FakeCapture()
     alerts = FakeAlert()
@@ -169,6 +175,30 @@ def test_dashboard_displays_capture_storage_failure_detail():
     dashboard._stop_capture()
 
     assert any("disk is full" in line for line in output)
+
+
+def test_dashboard_receives_disconnect_notice_while_waiting_for_input():
+    waiting = threading.Event()
+    release = threading.Event()
+    output = []
+    capture = NotifyingFakeCapture()
+
+    def blocking_input(_):
+        waiting.set()
+        release.wait(timeout=2)
+        return "7"
+
+    dashboard = Dashboard(capture, FakeSummary(), blocking_input, output.append)
+    runner = threading.Thread(target=dashboard.run)
+    runner.start()
+    assert waiting.wait(timeout=1)
+
+    capture.notifier("Link loss on interface 'eth0'; stopping capture safely.")
+
+    assert any("Link loss" in line for line in output)
+    release.set()
+    runner.join(timeout=2)
+    assert not runner.is_alive()
 
 
 def test_dashboard_renders_summary_from_synthetic_conn_log(
