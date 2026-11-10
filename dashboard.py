@@ -1,17 +1,26 @@
 """Small terminal controller for capture and PPS-04 traffic summaries."""
 
 from collections.abc import Callable
+from typing import Protocol
 
-from core.types import Status
+from core.types import Result, Status
 from services.alert_service import AlertService
-from services.capture_service import CaptureService
+from services.capture_service import CaptureSession, CaptureService
 from services.summary_service import SummaryService, render_summary
+
+
+class CaptureController(Protocol):
+    def list_interfaces(self) -> Result[list[str]]: ...
+
+    def start_capture(self, interface_name: str) -> Result[CaptureSession]: ...
+
+    def stop_capture(self, session_id: str) -> Status: ...
 
 
 class Dashboard:
     def __init__(
         self,
-        capture_service: CaptureService | None = None,
+        capture_service: CaptureController | None = None,
         summary_service: SummaryService | None = None,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
@@ -148,7 +157,11 @@ class Dashboard:
         session = self.session
         status = self.capture_service.stop_capture(session.session_id)
         if status is not Status.OK:
-            self.output(f"ERROR: capture: could not stop session ({status.value}).")
+            detail = getattr(self.capture_service, "last_error", "")
+            message = f"ERROR: capture: could not stop session ({status.value})"
+            if detail:
+                message += f": {detail}"
+            self.output(message + ".")
             return
         self.capture_active = False
         self.output("Capture stopped safely. The final summary is:")

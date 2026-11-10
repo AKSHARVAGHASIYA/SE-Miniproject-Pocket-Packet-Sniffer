@@ -3,7 +3,7 @@
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from core.types import Result, Status, Summary
 from services.capture_service import CaptureSession
@@ -52,7 +52,7 @@ class SummaryService:
             protocol_breakdown=dict(sorted(totals.protocol_breakdown.items())),
             top_talkers=sorted(totals.talkers.items(), key=lambda item: (-item[1], item[0])),
             connection_count=totals.connection_count,
-            updated_at=datetime.now(UTC),
+            updated_at=datetime.now(timezone.utc),
         )
         return Result(status=Status.OK, value=summary, detail=result.detail)
 

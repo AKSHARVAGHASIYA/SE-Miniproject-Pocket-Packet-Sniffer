@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from core.types import Status
 from services.capture_service import CaptureSession
@@ -135,3 +136,24 @@ def test_consumers_with_separate_readers_do_not_interfere(tmp_path):
 
     assert dashboard_reader.read(session, ["notice"]).value[0].fields["note"] == "Scan"
     assert alert_reader.read(session, ["notice"]).value[0].fields["note"] == "Scan"
+
+
+def test_reads_synthetic_zeek_log_fixtures_without_capture_tools(
+    tmp_path, sample_zeek_logs
+):
+    session = make_session(tmp_path)
+    for log_name in ("conn.log", "notice.log"):
+        shutil.copyfile(sample_zeek_logs / log_name, session.zeek_directory / log_name)
+
+    result = LogReader().read(session)
+
+    assert result.status is Status.OK
+    assert [(record.log_name, record.fields["uid"]) for record in result.value] == [
+        ("conn", "C_SYNTH_001"),
+        ("conn", "C_SYNTH_002"),
+        ("conn", "C_SYNTH_003"),
+        ("notice", "N_SYNTH_001"),
+        ("notice", "N_SYNTH_002"),
+        ("notice", "N_SYNTH_003"),
+        ("notice", "N_SYNTH_004"),
+    ]

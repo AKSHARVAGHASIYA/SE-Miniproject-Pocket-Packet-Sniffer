@@ -7,9 +7,11 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.types import Result, Status
+from services.session_index import SessionIndex, SessionRecord
 
 IFF_UP = 0x1
 DEFAULT_SESSION_ROOT = (
@@ -35,6 +37,8 @@ class _RunningCapture:
     session: CaptureSession
     zeek_process: subprocess.Popen
     tcpdump_process: subprocess.Popen
+    started_at: datetime
+    ended_at: datetime | None = None
 
 
 def interface_is_up(interface_name: str) -> bool:
@@ -56,6 +60,7 @@ class CaptureService:
         executable_locator: Callable[[str], str | None] = shutil.which,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
         zeek_policy_path: Path = DEFAULT_ZEEK_POLICY,
+        session_index: SessionIndex | None = None,
     ) -> None:
         self._interface_discoverer = interface_discoverer
         self._interface_up_checker = interface_up_checker
@@ -63,9 +68,19 @@ class CaptureService:
         self._executable_locator = executable_locator
         self._process_factory = process_factory
         self._zeek_policy_path = Path(zeek_policy_path)
+        self._session_index = session_index or SessionIndex(self._session_root)
         self._running_captures: dict[str, _RunningCapture] = {}
         self._interface_sessions: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._last_error = ""
+
+    @property
+    def last_error(self) -> str:
+        """Detail for the most recent stop failure, if any."""
+        return self._last_error
+
+    def list_completed_sessions(self) -> Result[list[SessionRecord]]:
+        return self._session_index.list_sessions()
 
     def list_interfaces(self) -> Result[list[str]]:
         try:
@@ -214,40 +229,92 @@ class CaptureService:
                 session=session,
                 zeek_process=zeek_process,
                 tcpdump_process=tcpdump_process,
+                started_at=datetime.now(timezone.utc),
             )
             self._interface_sessions[interface_name] = session_id
             return Result(status=Status.OK, value=session)
 
     def stop_capture(self, session_id: str) -> Status:
         with self._lock:
+            self._last_error = ""
             capture = self._running_captures.get(session_id)
             if capture is None:
                 return Status.NOT_FOUND
 
-            errors = self._stop_processes(
-                [capture.tcpdump_process, capture.zeek_process]
-            )
-            processes_stopped = all(
-                process.poll() is not None
-                for process in (
-                    capture.tcpdump_process,
-                    capture.zeek_process,
+            errors: list[str] = []
+            if capture.ended_at is None:
+                errors.extend(
+                    self._stop_processes(
+                        [capture.tcpdump_process, capture.zeek_process]
+                    )
                 )
-            )
+                processes_stopped = all(
+                    process.poll() is not None
+                    for process in (
+                        capture.tcpdump_process,
+                        capture.zeek_process,
+                    )
+                )
+                if processes_stopped:
+                    capture.ended_at = datetime.now(timezone.utc)
+                    self._interface_sessions.pop(
+                        capture.session.interface_name, None
+                    )
 
-            if processes_stopped:
-                self._running_captures.pop(session_id, None)
+            permission_error = False
+            if capture.ended_at is not None:
                 self._interface_sessions.pop(capture.session.interface_name, None)
                 try:
                     self._restrict_session_files(capture.session.session_directory)
+                    record = self._completed_session_record(capture)
+                    index_result = self._session_index.add_completed_session(record)
+                    if index_result.status is not Status.OK:
+                        errors.append(index_result.detail)
+                        permission_error = (
+                            index_result.status is Status.PERMISSION_ERROR
+                        )
+                    else:
+                        self._running_captures.pop(session_id, None)
+                except PermissionError as error:
+                    permission_error = True
+                    errors.append(
+                        f"Permission denied while finalizing session files: {error}"
+                    )
                 except OSError as error:
                     errors.append(
-                        f"Could not restrict session file permissions: {error}"
+                        f"Could not finalize session files or index: {error}"
                     )
 
             if errors:
-                return Status.IO_ERROR
+                self._last_error = "; ".join(error for error in errors if error)
+                return (
+                    Status.PERMISSION_ERROR
+                    if permission_error
+                    else Status.IO_ERROR
+                )
             return Status.OK
+
+    def _completed_session_record(
+        self, capture: _RunningCapture
+    ) -> SessionRecord:
+        if capture.ended_at is None:
+            raise RuntimeError("session must be stopped before it is indexed")
+        log_paths = tuple(
+            sorted(
+                path.resolve()
+                for path in capture.session.zeek_directory.rglob("*")
+                if path.is_file()
+            )
+        )
+        return SessionRecord(
+            session_id=capture.session.session_id,
+            interface_name=capture.session.interface_name,
+            started_at=capture.started_at,
+            ended_at=capture.ended_at,
+            pcap_path=capture.session.pcap_path,
+            zeek_directory=capture.session.zeek_directory,
+            zeek_log_paths=log_paths,
+        )
 
     def _create_private_directory(self, path: Path) -> None:
         path.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -299,6 +366,8 @@ class CaptureService:
                     "-n",
                     "-i",
                     session.interface_name,
+                    "-Z",
+                    "root",
                     "-w",
                     str(session.pcap_path),
                 ],

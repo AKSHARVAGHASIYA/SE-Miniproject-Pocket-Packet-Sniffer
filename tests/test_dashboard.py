@@ -1,7 +1,11 @@
 from dataclasses import dataclass
+from pathlib import Path
+import shutil
 
 from core.types import Result, Status, Summary
 from dashboard import Dashboard
+from services.capture_service import CaptureSession
+from services.summary_service import SummaryService
 
 
 @dataclass
@@ -151,3 +155,48 @@ def test_dashboard_displays_message_when_no_alerts_exist():
 
     assert "No supported scan alerts detected for this session." in text
     assert capture.stopped == ["s1"]
+
+
+def test_dashboard_displays_capture_storage_failure_detail():
+    output = []
+    capture = FakeCapture()
+    capture.last_error = "Could not update session index: disk is full"
+    capture.stop_capture = lambda _: Status.IO_ERROR
+    dashboard = Dashboard(capture, FakeSummary(), output_fn=output.append)
+    dashboard.session = capture.session
+    dashboard.capture_active = True
+
+    dashboard._stop_capture()
+
+    assert any("disk is full" in line for line in output)
+
+
+def test_dashboard_renders_summary_from_synthetic_conn_log(
+    tmp_path, sample_zeek_logs
+):
+    session_directory = tmp_path / "dashboard-fixture"
+    zeek_directory = session_directory / "zeek"
+    zeek_directory.mkdir(parents=True)
+    shutil.copyfile(sample_zeek_logs / "conn.log", zeek_directory / "conn.log")
+    session = CaptureSession(
+        "dashboard-fixture",
+        "eth0",
+        session_directory,
+        session_directory / "capture.pcap",
+        zeek_directory,
+    )
+    output = []
+    dashboard = Dashboard(
+        FakeCapture(),
+        SummaryService(),
+        output_fn=output.append,
+    )
+    dashboard.session = session
+
+    dashboard._view_summary()
+
+    rendered = "\n".join(output)
+    assert "Total connections: 3" in rendered
+    assert "tcp: 2" in rendered
+    assert "udp: 1" in rendered
+    assert "192.0.2.10: 3 connection(s)" in rendered

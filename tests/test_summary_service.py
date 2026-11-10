@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from core.types import Status
 from services.capture_service import CaptureSession
@@ -111,3 +112,22 @@ def test_render_summary_explains_top_talker_measure_and_empty_state(tmp_path):
     assert "No complete conn.log records" in empty
     assert "start traffic" in empty
 
+
+def test_summarizes_synthetic_conn_log_fixture_without_live_capture(
+    tmp_path, sample_zeek_logs
+):
+    session = make_session(tmp_path, "fixture")
+    shutil.copyfile(
+        sample_zeek_logs / "conn.log", session.zeek_directory / "conn.log"
+    )
+
+    result = SummaryService().get_summary(session)
+
+    assert result.status is Status.OK
+    assert result.value.connection_count == 3
+    assert result.value.protocol_breakdown == {"tcp": 2, "udp": 1}
+    assert result.value.top_talkers == [
+        ("192.0.2.10", 3),
+        ("203.0.113.8", 2),
+        ("198.51.100.20", 1),
+    ]
