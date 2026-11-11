@@ -1,5 +1,6 @@
 """Small terminal controller for capture and PPS-04 traffic summaries."""
 
+import threading
 from collections.abc import Callable
 from typing import Protocol
 
@@ -7,6 +8,8 @@ from core.types import Result, Status
 from services.alert_service import AlertService
 from services.capture_service import CaptureSession, CaptureService
 from services.summary_service import SummaryService, render_summary
+
+SUMMARY_REFRESH_INTERVAL_SECONDS = 1.0
 
 
 class CaptureController(Protocol):
@@ -30,12 +33,22 @@ class Dashboard:
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
         alert_service: AlertService | None = None,
+        summary_refresh_interval_seconds: float = SUMMARY_REFRESH_INTERVAL_SECONDS,
     ) -> None:
+        if summary_refresh_interval_seconds <= 0:
+            raise ValueError("Summary refresh interval must be greater than zero.")
         self.capture_service = capture_service or CaptureService()
         self.summary_service = summary_service or SummaryService()
         self.alert_service = alert_service or AlertService()
         self.input = input_fn
-        self.output = output_fn
+        self._output_fn = output_fn
+        self._output_lock = threading.Lock()
+        self._summary_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._summary_refresh_interval_seconds = summary_refresh_interval_seconds
+        self._summary_refresh_stop: threading.Event | None = None
+        self._summary_refresh_thread: threading.Thread | None = None
+        self.output = self._write_output
         self.session = None
         self.capture_active = False
         set_notifier = getattr(self.capture_service, "set_event_notifier", None)
@@ -45,36 +58,48 @@ class Dashboard:
     def run(self) -> None:
         self.output("Pocket Packet Sniffer - traffic dashboard")
         self.output("Choose an interface, start capture, view the summary, then stop safely.")
-        while True:
-            self.output(
-                "\n1) List interfaces  "
-                "2) Start capture  "
-                "3) View summary  "
-                "4) Stop capture  "
-                "5) Toggle alerting  "
-                "6) View alerts  "
-                "7) Exit"
-            )
-            choice = self.input("Select an option: ").strip()
-            if choice == "1":
-                self._list_interfaces()
-            elif choice == "2":
-                self._start_capture()
-            elif choice == "3":
-                self._view_summary()
-            elif choice == "4":
-                self._stop_capture()
-            elif choice == "5":
-                self._toggle_alerting()
-            elif choice == "6":
-                self._view_alerts()
-            elif choice == "7":
-                if self.capture_active:
-                    self.output("Stopping the active capture before exit...")
+        try:
+            while True:
+                self.output(
+                    "\n1) List interfaces  "
+                    "2) Start capture  "
+                    "3) View summary  "
+                    "4) Stop capture  "
+                    "5) Toggle alerting  "
+                    "6) View alerts  "
+                    "7) Exit"
+                )
+                choice = self.input("Select an option: ").strip()
+                if choice == "1":
+                    self._list_interfaces()
+                elif choice == "2":
+                    self._start_capture()
+                elif choice == "3":
+                    self._view_summary()
+                elif choice == "4":
                     self._stop_capture()
-                break
-            else:
-                self.output("ERROR: input: choose an option from 1 to 7.")
+                elif choice == "5":
+                    self._toggle_alerting()
+                elif choice == "6":
+                    self._view_alerts()
+                elif choice == "7":
+                    with self._state_lock:
+                        capture_active = self.capture_active
+                    if capture_active:
+                        self.output("Stopping the active capture before exit...")
+                        self._stop_capture()
+                    break
+                else:
+                    self.output("ERROR: input: choose an option from 1 to 7.")
+        finally:
+            self._stop_summary_refresh()
+            set_notifier = getattr(self.capture_service, "set_event_notifier", None)
+            if callable(set_notifier):
+                set_notifier(None)
+
+    def _write_output(self, message: str) -> None:
+        with self._output_lock:
+            self._output_fn(message)
 
     def _list_interfaces(self) -> None:
         result = self.capture_service.list_interfaces()
@@ -135,7 +160,9 @@ class Dashboard:
             self.output(f"  Reason: {alert.reason}")
 
     def _start_capture(self) -> None:
-        if self.capture_active:
+        with self._state_lock:
+            capture_active = self.capture_active
+        if capture_active:
             self.output("ERROR: a capture is already running. View or stop it first.")
             return
         interface = self.input("Interface name (use option 1 to list): ").strip()
@@ -153,34 +180,152 @@ class Dashboard:
         if result.status is not Status.OK:
             self.output(f"ERROR: capture: {result.detail}")
             return
-        self.session = result.value
-        self.capture_active = True
+        session = result.value
+        with self._state_lock:
+            self.session = session
+            self.capture_active = True
         options = []
-        duration_seconds = getattr(self.session, "duration_seconds", None)
-        protocol_filter = getattr(self.session, "protocol_filter", None)
+        duration_seconds = getattr(session, "duration_seconds", None)
+        protocol_filter = getattr(session, "protocol_filter", None)
         if duration_seconds is not None:
             options.append(f"maximum {duration_seconds} seconds")
         if protocol_filter is not None:
             options.append(f"{protocol_filter.upper()} only")
         suffix = f" ({', '.join(options)})." if options else "."
-        self.output(f"Capture started on {self.session.interface_name}{suffix}")
-        self.output("Choose View summary regularly to see new conn.log records.")
+        self.output(f"Capture started on {session.interface_name}{suffix}")
+        interval = self._summary_refresh_interval_seconds
+        interval_unit = "second" if interval == 1 else "seconds"
+        self.output(
+            "Traffic summaries refresh automatically when new complete conn.log "
+            f"records arrive (checked every {interval:g} {interval_unit})."
+        )
+        self._start_summary_refresh(session)
 
     def _view_summary(self) -> None:
-        if self.session is None:
+        with self._state_lock:
+            session = self.session
+        if session is None:
             self.output("No session is selected. Start a capture first.")
             return
-        result = self.summary_service.get_summary(self.session)
+        with self._summary_lock:
+            self._display_summary(session)
+
+    def _display_summary(self, session: CaptureSession) -> None:
+        result = self.summary_service.get_summary(session)
         if result.status is not Status.OK:
-            self.output(f"ERROR: summary: {result.detail}")
+            detail = result.detail or result.status.value
+            self.output(f"ERROR: summary: {detail}")
             return
+        if result.value is None:
+            self.output("ERROR: summary: summary service returned no summary.")
+            return
+        if result.detail:
+            self.output(f"WARNING: summary: {result.detail}")
         self.output(render_summary(result.value))
 
+    def _start_summary_refresh(self, session: CaptureSession) -> None:
+        self._stop_summary_refresh()
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._refresh_summary_loop,
+            args=(session, stop_event),
+            name=f"summary-refresh-{session.session_id[:8]}",
+            daemon=True,
+        )
+        with self._state_lock:
+            if self.session is not session or not self.capture_active:
+                return
+            self._summary_refresh_stop = stop_event
+            self._summary_refresh_thread = thread
+        thread.start()
+
+    def _is_summary_refresh_current(
+        self, session: CaptureSession, stop_event: threading.Event
+    ) -> bool:
+        with self._state_lock:
+            return (
+                self._summary_refresh_stop is stop_event
+                and self.session is session
+                and self.capture_active
+            )
+
+    def _write_refresh_output(
+        self, session: CaptureSession, stop_event: threading.Event, message: str
+    ) -> bool:
+        with self._state_lock:
+            if (
+                self._summary_refresh_stop is not stop_event
+                or self.session is not session
+                or not self.capture_active
+            ):
+                return False
+            self.output(message)
+            return True
+
+    def _stop_summary_refresh(self) -> None:
+        with self._state_lock:
+            stop_event = self._summary_refresh_stop
+            thread = self._summary_refresh_thread
+            if stop_event is not None:
+                stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._state_lock:
+            if self._summary_refresh_thread is thread:
+                self._summary_refresh_stop = None
+                self._summary_refresh_thread = None
+
+    def _refresh_summary_loop(
+        self, session: CaptureSession, stop_event: threading.Event
+    ) -> None:
+        previous_signature = None
+        previous_error = None
+        previous_detail = None
+        while not stop_event.wait(self._summary_refresh_interval_seconds):
+            if not self._is_summary_refresh_current(session, stop_event):
+                return
+
+            with self._summary_lock:
+                result = self.summary_service.get_summary(session)
+                if result.status is not Status.OK or result.value is None:
+                    detail = result.detail or (
+                        result.status.value
+                        if result.status is not Status.OK
+                        else "summary service returned no summary."
+                    )
+                    if detail != previous_error:
+                        self._write_refresh_output(
+                            session, stop_event, f"ERROR: summary: {detail}"
+                        )
+                    previous_error = detail
+                    continue
+
+                previous_error = None
+                if result.detail and result.detail != previous_detail:
+                    self._write_refresh_output(
+                        session, stop_event, f"WARNING: summary: {result.detail}"
+                    )
+                previous_detail = result.detail
+
+                summary = result.value
+                signature = (
+                    summary.connection_count,
+                    tuple(sorted(summary.protocol_breakdown.items())),
+                    tuple(summary.top_talkers),
+                )
+                if signature != previous_signature:
+                    if not self._write_refresh_output(
+                        session, stop_event, render_summary(summary)
+                    ):
+                        return
+                    previous_signature = signature
+
     def _stop_capture(self) -> None:
-        if self.session is None:
+        with self._state_lock:
+            session = self.session
+        if session is None:
             self.output("No capture is running.")
             return
-        session = self.session
         status = self.capture_service.stop_capture(session.session_id)
         if status is not Status.OK:
             detail = getattr(self.capture_service, "last_error", "")
@@ -189,19 +334,35 @@ class Dashboard:
                 message += f": {detail}"
             self.output(message + ".")
             return
-        self.capture_active = False
+        with self._state_lock:
+            self.capture_active = False
+            stop_event = self._summary_refresh_stop
+            if stop_event is not None:
+                stop_event.set()
+        self._stop_summary_refresh()
         self.output("Capture stopped safely. The final summary is:")
-        result = self.summary_service.get_summary(session)
-        if result.status is Status.OK:
-            self.output(render_summary(result.value))
-        else:
-            self.output(f"ERROR: summary: {result.detail}")
+        with self._summary_lock:
+            result = self.summary_service.get_summary(session)
+            if result.status is Status.OK:
+                if result.value is None:
+                    self.output("ERROR: summary: summary service returned no summary.")
+                else:
+                    if result.detail:
+                        self.output(f"WARNING: summary: {result.detail}")
+                    self.output(render_summary(result.value))
+            else:
+                detail = result.detail or result.status.value
+                self.output(f"ERROR: summary: {detail}")
 
     def _on_capture_event(self, message: str) -> None:
         """Print monitor warnings immediately, even while input() is waiting."""
+        if "stopping capture safely" in message.lower():
+            with self._state_lock:
+                self.capture_active = False
+                stop_event = self._summary_refresh_stop
+                if stop_event is not None:
+                    stop_event.set()
         self.output(message)
-        if "stopping capture safely" in message:
-            self.capture_active = False
 
 
 if __name__ == "__main__":
