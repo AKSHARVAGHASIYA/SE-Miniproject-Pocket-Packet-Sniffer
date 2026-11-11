@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import threading
 
 from core.types import Result, Status, Summary
 from services.capture_service import CaptureSession
@@ -34,27 +35,29 @@ class SummaryService:
         self._reader = reader or reader_factory()
         self._reader_factory = reader_factory
         self._totals: dict[str, _SessionTotals] = {}
+        self._lock = threading.Lock()
 
     def get_summary(self, session: CaptureSession) -> Result[Summary]:
         """Read new conn.log records and return the current session summary."""
         if not isinstance(session, CaptureSession):
             return Result(status=Status.INVALID_INPUT, detail="A capture session is required.")
 
-        result = self._reader.read(session, ["conn"])
-        if result.status is not Status.OK:
-            return Result(status=result.status, detail=result.detail)
+        with self._lock:
+            result = self._reader.read(session, ["conn"])
+            if result.status is not Status.OK:
+                return Result(status=result.status, detail=result.detail)
 
-        totals = self._totals.setdefault(session.session_id, _SessionTotals())
-        for record in result.value or []:
-            self._add_record(totals, record)
+            totals = self._totals.setdefault(session.session_id, _SessionTotals())
+            for record in result.value or []:
+                self._add_record(totals, record)
 
-        summary = Summary(
-            protocol_breakdown=dict(sorted(totals.protocol_breakdown.items())),
-            top_talkers=sorted(totals.talkers.items(), key=lambda item: (-item[1], item[0])),
-            connection_count=totals.connection_count,
-            updated_at=datetime.now(timezone.utc),
-        )
-        return Result(status=Status.OK, value=summary, detail=result.detail)
+            summary = Summary(
+                protocol_breakdown=dict(sorted(totals.protocol_breakdown.items())),
+                top_talkers=sorted(totals.talkers.items(), key=lambda item: (-item[1], item[0])),
+                connection_count=totals.connection_count,
+                updated_at=datetime.now(timezone.utc),
+            )
+            return Result(status=Status.OK, value=summary, detail=result.detail)
 
     def reset(self, session_id: str) -> Status:
         """Forget accumulated totals for a session.
@@ -63,10 +66,11 @@ class SummaryService:
         aggregation from records appended after the reset, rather than
         unexpectedly double-counting the existing log.
         """
-        if session_id not in self._totals:
-            return Status.NOT_FOUND
-        self._totals.pop(session_id)
-        return Status.OK
+        with self._lock:
+            if session_id not in self._totals:
+                return Status.NOT_FOUND
+            self._totals.pop(session_id)
+            return Status.OK
 
     @staticmethod
     def _add_record(totals: _SessionTotals, record: ZeekLogRecord) -> None:

@@ -7,9 +7,13 @@ Run the terminal dashboard from the repository root:
 ```
 
 Choose `1` to list interfaces, `2` to start a capture, `3` to refresh the
-summary, `4` to stop safely, and `5` to exit. The dashboard can be viewed while
-Zeek is writing logs and again after capture stops. It reads only the session's
-`conn.log`; it does not require live hardware in the automated tests.
+summary manually, `4` to stop safely, and `7` to exit (options `5` and `6`
+control alerting). During active capture,
+the dashboard also checks for new complete records every second and displays
+an updated summary when the totals change. Menu input remains available while
+these updates are printed. The final summary remains available after capture
+stops. The dashboard reads only the session's `conn.log`; it does not require
+live hardware in the automated tests.
 
 ## How to interpret the summary
 
@@ -30,9 +34,11 @@ These are provisional definitions pending team approval:
   packet-volume host.
 
 The summary keeps running totals per capture session and consumes only newly
-appended records on each refresh. A separate `LogReader` owned by
-`SummaryService` means a future alert consumer can read the same logs with its
-own cursor.
+appended records on each refresh. Complete records are visible within the next
+poll; an incomplete line is retained by the incremental reader until its
+newline arrives. Manual and automatic summary requests are serialized. A
+separate `LogReader` owned by `SummaryService` means the alert service can read
+the same logs with its own cursor.
 
 ## Dependencies and permissions
 
