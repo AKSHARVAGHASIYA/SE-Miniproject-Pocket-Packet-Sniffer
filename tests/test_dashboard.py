@@ -1,11 +1,13 @@
-from dataclasses import dataclass
-from pathlib import Path
 import shutil
 import threading
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from core.types import Result, Status, Summary
 from dashboard import Dashboard
 from services.capture_service import CaptureSession
+from services.session_index import SessionRecord
 from services.summary_service import SummaryService
 
 
@@ -23,6 +25,9 @@ class FakeCapture:
     def list_interfaces(self):
         return Result(Status.OK, ["eth0"])
 
+    def list_completed_sessions(self):
+        return Result(Status.OK, [])
+
     def start_capture(self, interface, duration=None, protocol_filter=None):
         return Result(Status.OK, self.session) if interface == "eth0" else Result(Status.INTERFACE_UNAVAILABLE, detail="not available")
 
@@ -30,6 +35,18 @@ class FakeCapture:
         self.stopped.append(session_id)
         return Status.OK
 
+def make_past_session(session_id="past-1", interface="en0"):
+    started = datetime(2026, 11, 10, 10, 0, tzinfo=UTC)
+
+    return SessionRecord(
+        session_id=session_id,
+        interface_name=interface,
+        started_at=started,
+        ended_at=started + timedelta(minutes=5),
+        pcap_path=Path(f"/tmp/{session_id}/capture.pcap"),
+        zeek_directory=Path(f"/tmp/{session_id}/zeek"),
+        zeek_log_paths=(),
+    )
 
 class NotifyingFakeCapture(FakeCapture):
     def set_event_notifier(self, notifier):
@@ -230,3 +247,95 @@ def test_dashboard_renders_summary_from_synthetic_conn_log(
     assert "tcp: 2" in rendered
     assert "udp: 1" in rendered
     assert "192.0.2.10: 3 connection(s)" in rendered
+
+
+def test_browse_past_sessions_displays_history():
+    output = []
+    capture = FakeCapture()
+    capture.list_completed_sessions = lambda: Result(
+        Status.OK,
+        [make_past_session()]
+    )
+
+    dashboard = Dashboard(
+        capture, FakeSummary(), input_fn=lambda _: "0",
+        output_fn=output.append
+    )
+
+    dashboard._browse_past_sessions()
+
+    text = "\n".join(output)
+    assert "Past Capture Sessions" in text
+    assert "past-1" in text
+    assert "en0" in text
+    assert "00:05:00" in text
+
+
+def test_browse_past_sessions_handles_empty_history():
+    output = []
+    dashboard = Dashboard(
+        FakeCapture(), FakeSummary(), output_fn=output.append
+    )
+
+    dashboard._browse_past_sessions()
+
+    assert "No past capture sessions found." in "\n".join(output)
+
+
+def test_browse_past_sessions_selects_session():
+    output = []
+    capture = FakeCapture()
+    capture.list_completed_sessions = lambda: Result(
+        Status.OK,
+        [make_past_session()]
+    )
+
+    dashboard = Dashboard(
+        capture, FakeSummary(), input_fn=lambda _: "1",
+        output_fn=output.append
+    )
+
+    dashboard._browse_past_sessions()
+
+    assert dashboard.session.session_id == "past-1"
+    assert dashboard.session.interface_name == "en0"
+    assert any("Selected past session" in line for line in output)
+
+
+def test_browse_past_sessions_rejects_invalid_selection():
+    output = []
+    capture = FakeCapture()
+    capture.list_completed_sessions = lambda: Result(
+        Status.OK,
+        [make_past_session()]
+    )
+
+    dashboard = Dashboard(
+        capture, FakeSummary(), input_fn=lambda _: "99",
+        output_fn=output.append
+    )
+
+    dashboard._browse_past_sessions()
+
+    assert dashboard.session is None
+    assert any("Invalid session selection" in line for line in output)
+
+def test_historical_session_cannot_be_stopped():
+    output = []
+    capture = FakeCapture()
+    dashboard = Dashboard(
+        capture,
+        FakeSummary(),
+        output_fn=output.append,
+    )
+
+    dashboard.session = make_past_session()
+    dashboard.capture_active = False
+
+    dashboard._stop_capture()
+
+    assert capture.stopped == []
+    assert any(
+        "Historical sessions cannot be stopped" in line
+        for line in output
+    )

@@ -6,7 +6,7 @@ from typing import Protocol
 
 from core.types import Result, Status
 from services.alert_service import AlertService
-from services.capture_service import CaptureSession, CaptureService
+from services.capture_service import CaptureService, CaptureSession
 from services.summary_service import SummaryService, render_summary
 
 SUMMARY_REFRESH_INTERVAL_SECONDS = 1.0
@@ -67,7 +67,8 @@ class Dashboard:
                     "4) Stop capture  "
                     "5) Toggle alerting  "
                     "6) View alerts  "
-                    "7) Exit"
+                    "7) Exit  "
+                    "8) Browse past sessions"
                 )
                 choice = self.input("Select an option: ").strip()
                 if choice == "1":
@@ -89,8 +90,12 @@ class Dashboard:
                         self.output("Stopping the active capture before exit...")
                         self._stop_capture()
                     break
+                elif choice == "8":
+                    self._browse_past_sessions()
+
                 else:
-                    self.output("ERROR: input: choose an option from 1 to 7.")
+                    self.output("ERROR: input: choose an option from 1 to 8.")
+
         finally:
             self._stop_summary_refresh()
             set_notifier = getattr(self.capture_service, "set_event_notifier", None)
@@ -100,6 +105,98 @@ class Dashboard:
     def _write_output(self, message: str) -> None:
         with self._output_lock:
             self._output_fn(message)
+
+
+    def _browse_past_sessions(self) -> None:
+        """Browse and select a previously completed capture session."""
+        with self._state_lock:
+            if self.capture_active:
+                self.output(
+                    "ERROR: Stop the active capture before selecting a past session."
+                )
+                return
+
+        list_sessions = getattr(
+            self.capture_service, "list_completed_sessions", None
+        )
+
+        if not callable(list_sessions):
+            self.output("ERROR: Session history is not supported by this capture service.")
+            return
+
+        result = list_sessions()
+
+        if result.status is not Status.OK:
+            self.output(f"ERROR: session history: {result.detail}")
+            return
+
+        sessions = result.value or []
+
+        if not sessions:
+            self.output("No past capture sessions found.")
+            return
+
+        self.output("\nPast Capture Sessions")
+        self.output("=====================")
+
+        for index, record in enumerate(sessions, start=1):
+            duration = record.ended_at - record.started_at
+            total_seconds = int(duration.total_seconds())
+            hours, remainder = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+
+            self.output(
+                f"{index}) Session: {record.session_id}\n"
+                f"   Date: {record.started_at.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                f"   Duration: {hours:02}:{minutes:02}:{seconds:02}\n"
+                f"   Interface: {record.interface_name}"
+            )
+
+        self.output("0) Cancel")
+
+        choice = self.input("Select a session number: ").strip()
+
+        if choice == "0":
+            self.output("Session selection cancelled.")
+            return
+
+        try:
+            selected_index = int(choice)
+        except ValueError:
+            self.output("ERROR: Enter a valid session number.")
+            return
+
+        if selected_index < 1 or selected_index > len(sessions):
+            self.output("ERROR: Invalid session selection.")
+            return
+
+        record = sessions[selected_index - 1]
+
+        selected_session = CaptureSession(
+            session_id=record.session_id,
+            interface_name=record.interface_name,
+            session_directory=record.pcap_path.parent,
+            pcap_path=record.pcap_path,
+            zeek_directory=record.zeek_directory,
+        )
+
+        with self._state_lock:
+            if self.capture_active:
+                self.output(
+                    "ERROR: An active capture started during session selection."
+                )
+                return
+            self.session = selected_session
+
+        self.output(
+            f"Selected past session: {record.session_id}"
+        )
+        self.output(
+            f"Interface: {record.interface_name}"
+        )
+        self.output(
+            "You can now choose option 3 to view its traffic summary."
+        )
 
     def _list_interfaces(self) -> None:
         result = self.capture_service.list_interfaces()
@@ -323,9 +420,18 @@ class Dashboard:
     def _stop_capture(self) -> None:
         with self._state_lock:
             session = self.session
+            capture_active = self.capture_active
+
         if session is None:
             self.output("No capture is running.")
             return
+
+        if not capture_active:
+            self.output(
+                "No capture is running. Historical sessions cannot be stopped."
+            )
+            return
+
         status = self.capture_service.stop_capture(session.session_id)
         if status is not Status.OK:
             detail = getattr(self.capture_service, "last_error", "")
